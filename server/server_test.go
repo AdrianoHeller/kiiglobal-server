@@ -2,11 +2,15 @@ package server
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,5 +71,262 @@ func TestWebhookHandler_Success(t *testing.T) {
 	}
 	if got["user"] != "Alice" {
 		t.Fatalf("unexpected response JSON: %v", got)
+	}
+}
+
+func makeSignedWebhookRequest(t *testing.T, body []byte, accessKey, secretKey, adminKey string, ts int64, nonce string) *http.Request {
+	t.Helper()
+	if nonce == "" {
+		var err error
+		nonce, err = client.GenerateNonce(16)
+		if err != nil {
+			t.Fatalf("failed to generate nonce: %v", err)
+		}
+	}
+	if ts == 0 {
+		ts = time.Now().Unix()
+	}
+
+	bodyHash := sha256.Sum256(body)
+	canonical := fmt.Sprintf("%d\n%s\n%s", ts, nonce, hex.EncodeToString(bodyHash[:]))
+	mac := hmac.New(sha256.New, []byte(secretKey))
+	mac.Write([]byte(canonical))
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	req := httptest.NewRequest("GET", "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Access-Key", accessKey)
+	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", ts))
+	req.Header.Set("X-Nonce", nonce)
+	req.Header.Set("X-Signature", sig)
+	req.Header.Set("X-Admin-Key", adminKey)
+	return req
+}
+
+func TestWebhookHandler_HMACValidationScenarios(t *testing.T) {
+	s := NewServer(":0", nil)
+	accessKey := "test-access"
+	secret := "secret123"
+	s.SetSecretKey(accessKey, secret)
+	s.AdminKey = "admin-secret"
+
+	body := []byte(`{"user":"Alice","asset":"Gold","amount":10}`)
+	validNonce, err := client.GenerateNonce(16)
+	if err != nil {
+		t.Fatalf("failed to generate nonce: %v", err)
+	}
+	badNonce, err := client.GenerateNonce(16)
+	if err != nil {
+		t.Fatalf("failed to generate bad nonce: %v", err)
+	}
+
+	tests := []struct {
+		name        string
+		timestamp   int64
+		nonce       string
+		signature   string
+		adminKey    string
+		expectCode  int
+		expectError string
+	}{
+		{
+			name:       "valid request",
+			timestamp:  time.Now().Unix(),
+			adminKey:   s.AdminKey,
+			expectCode: http.StatusOK,
+		},
+		{
+			name:        "invalid signature",
+			timestamp:   time.Now().Unix(),
+			nonce:       badNonce,
+			signature:   "bad-signature",
+			adminKey:    s.AdminKey,
+			expectCode:  http.StatusUnauthorized,
+			expectError: "Invalid Signature",
+		},
+		{
+			name:        "expired timestamp",
+			timestamp:   time.Now().Add(-10 * time.Minute).Unix(),
+			adminKey:    s.AdminKey,
+			expectCode:  http.StatusUnauthorized,
+			expectError: "Invalid or expired timestamp",
+		},
+		{
+			name:        "nonce replay",
+			timestamp:   time.Now().Unix(),
+			nonce:       validNonce,
+			adminKey:    s.AdminKey,
+			expectCode:  http.StatusUnauthorized,
+			expectError: "Nonce Already Used",
+		},
+		{
+			name:        "wrong admin key",
+			timestamp:   time.Now().Unix(),
+			adminKey:    "wrong-admin",
+			expectCode:  http.StatusUnauthorized,
+			expectError: "Unauthorized Access",
+		},
+	}
+
+	for idx, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if idx == 3 {
+				// nonce replay sector: first request should be accepted
+				firstReq := makeSignedWebhookRequest(t, body, accessKey, secret, s.AdminKey, time.Now().Unix(), validNonce)
+				firstRR := httptest.NewRecorder()
+				http.HandlerFunc(s.WebhookHandler).ServeHTTP(firstRR, firstReq)
+				if firstRR.Code != http.StatusOK {
+					t.Fatalf("first request expected ok, got %d: %s", firstRR.Code, firstRR.Body.String())
+				}
+			}
+
+			var req *http.Request
+			if tc.signature != "" {
+				req = httptest.NewRequest("GET", "/webhook", bytes.NewReader(body))
+				req.Header.Set("X-Access-Key", accessKey)
+				req.Header.Set("X-Timestamp", fmt.Sprintf("%d", tc.timestamp))
+				req.Header.Set("X-Nonce", tc.nonce)
+				req.Header.Set("X-Signature", tc.signature)
+				req.Header.Set("X-Admin-Key", tc.adminKey)
+			} else {
+				req = makeSignedWebhookRequest(t, body, accessKey, secret, tc.adminKey, tc.timestamp, tc.nonce)
+			}
+
+			rr := httptest.NewRecorder()
+			http.HandlerFunc(s.WebhookHandler).ServeHTTP(rr, req)
+
+			if rr.Code != tc.expectCode {
+				t.Fatalf("expected status %d, got %d, body=%q", tc.expectCode, rr.Code, rr.Body.String())
+			}
+			if tc.expectError != "" && !strings.Contains(rr.Body.String(), tc.expectError) {
+				t.Fatalf("expected error %q, got body=%q", tc.expectError, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestWebhookHandler_NoNonceReplay(t *testing.T) {
+	s := NewServer(":0", nil)
+	accessKey := "replay-access"
+	secret := "replay-secret"
+	s.SetSecretKey(accessKey, secret)
+	s.AdminKey = "admin-secret"
+
+	body := []byte(`{"user":"Alice","asset":"Gold","amount":10}`)
+	nonce, err := client.GenerateNonce(16)
+	if err != nil {
+		t.Fatalf("failed to generate nonce: %v", err)
+	}
+	ts := time.Now().Unix()
+
+	firstReq := makeSignedWebhookRequest(t, body, accessKey, secret, s.AdminKey, ts, nonce)
+	firstRR := httptest.NewRecorder()
+	http.HandlerFunc(s.WebhookHandler).ServeHTTP(firstRR, firstReq)
+	if firstRR.Code != http.StatusOK {
+		t.Fatalf("first request expected 200 OK, got %d, body=%q", firstRR.Code, firstRR.Body.String())
+	}
+
+	secondReq := makeSignedWebhookRequest(t, body, accessKey, secret, s.AdminKey, ts, nonce)
+	secondRR := httptest.NewRecorder()
+	http.HandlerFunc(s.WebhookHandler).ServeHTTP(secondRR, secondReq)
+	if secondRR.Code != http.StatusUnauthorized {
+		t.Fatalf("second replay request expected 401 Unauthorized, got %d, body=%q", secondRR.Code, secondRR.Body.String())
+	}
+	if !strings.Contains(secondRR.Body.String(), "Nonce Already Used") {
+		t.Fatalf("expected nonce replay error, got body=%q", secondRR.Body.String())
+	}
+}
+
+func TestModifyUserBalanceScenarios(t *testing.T) {
+	type scenario struct {
+		name            string
+		userName        string
+		initialBalances map[string]string
+		asset           string
+		amount          float64
+		wantOK          bool
+		wantBalance     string
+	}
+
+	scenarios := []scenario{
+		{
+			name:            "deposit new asset",
+			userName:        "Alice",
+			initialBalances: map[string]string{},
+			asset:           "Gold",
+			amount:          10,
+			wantOK:          true,
+			wantBalance:     "10.00",
+		},
+		{
+			name:            "deposit existing asset",
+			userName:        "Alice",
+			initialBalances: map[string]string{"Gold": "5.00"},
+			asset:           "Gold",
+			amount:          5,
+			wantOK:          true,
+			wantBalance:     "10.00",
+		},
+		{
+			name:            "withdraw within balance",
+			userName:        "Alice",
+			initialBalances: map[string]string{"Gold": "10.00"},
+			asset:           "Gold",
+			amount:          -5,
+			wantOK:          true,
+			wantBalance:     "5.00",
+		},
+		{
+			name:            "withdraw exact balance",
+			userName:        "Alice",
+			initialBalances: map[string]string{"Gold": "10.00"},
+			asset:           "Gold",
+			amount:          -10,
+			wantOK:          true,
+			wantBalance:     "0.00",
+		},
+		{
+			name:            "withdraw over balance",
+			userName:        "Alice",
+			initialBalances: map[string]string{"Gold": "10.00"},
+			asset:           "Gold",
+			amount:          -15,
+			wantOK:          false,
+		},
+		{
+			name:            "user not found",
+			userName:        "Bob",
+			initialBalances: nil,
+			asset:           "Gold",
+			amount:          10,
+			wantOK:          false,
+		},
+	}
+
+	for _, tc := range scenarios {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewServer(":0", nil)
+			if tc.userName == "Bob" {
+				s.Users = []User{{Name: "Alice", Balances: tc.initialBalances}}
+			} else {
+				s.Users = []User{{Name: tc.userName, Balances: tc.initialBalances}}
+			}
+			w := httptest.NewRecorder()
+
+			ok := s.ModifyUserBalance(tc.userName, tc.asset, tc.amount, w)
+			if ok != tc.wantOK {
+				t.Fatalf("expected ok=%v, got %v, body=%q", tc.wantOK, ok, w.Body.String())
+			}
+
+			if tc.wantOK {
+				user, exists := s.GetUser(tc.userName)
+				if !exists {
+					t.Fatalf("expected user %q to exist", tc.userName)
+				}
+				gotBalance := user.Balances[tc.asset]
+				if gotBalance != tc.wantBalance {
+					t.Fatalf("expected balance %q, got %q", tc.wantBalance, gotBalance)
+				}
+			}
+		})
 	}
 }

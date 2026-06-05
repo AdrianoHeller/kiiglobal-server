@@ -128,6 +128,67 @@ func (s *Server) GetSecretKey(accessKey string) (string, bool) {
 	return secretKey, exists
 }
 
+func (s *Server) CheckUser(user User) {
+
+	s.Vault.Mu.Lock()
+	defer s.Vault.Mu.Unlock()
+	// Check if user already exists
+	for i, u := range s.Users {
+		if u.Name == user.Name {
+			s.Users[i] = user
+			return
+		}
+	}
+	// If user doesn't exist, add to the list
+	s.Users = append(s.Users, user)
+}
+
+func (s *Server) GetUser(name string) (User, bool) {
+
+	s.Vault.Mu.RLock()
+	defer s.Vault.Mu.RUnlock()
+
+	for _, u := range s.Users {
+		if u.Name == name {
+			return u, true
+		}
+	}
+	return User{}, false
+}
+
+func (s *Server) GetAllUsers() []User {
+	s.Vault.Mu.RLock()
+	defer s.Vault.Mu.RUnlock()
+
+	return s.Users
+}
+
+func (s *Server) ModifyUserBalance(userName, asset string, amount float64, w http.ResponseWriter) bool {
+
+	s.Vault.Mu.Lock()
+	defer s.Vault.Mu.Unlock()
+	for i, u := range s.Users {
+		if u.Name == userName {
+			if u.Balances == nil {
+				s.Users[i].Balances = make(map[string]string)
+			}
+			currentBalanceStr, exists := u.Balances[asset]
+			var currentBalance float64
+			if exists {
+				currentBalance, _ = strconv.ParseFloat(currentBalanceStr, 64)
+			}
+			if currentBalance+amount < 0 {
+				s.logError(w, fmt.Sprintf("Invalid balance in the %s for the User to perform the transaction", asset), http.StatusBadRequest)
+				return false
+			}
+			newBalance := currentBalance + amount
+			s.Users[i].Balances[asset] = fmt.Sprintf("%.2f", newBalance)
+			return true
+		}
+	}
+	return false
+}
+
 // Hashing functions
 func (s *Server) ComputeHmacSignature(timestamp int64, body []byte, nonce, secretKey string) string {
 	bodyHash := sha256.New()
@@ -223,6 +284,12 @@ func (s *Server) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		s.logError(w, "Invalid Timestamp", http.StatusBadRequest)
+		return
+	}
+
 	if !s.CheckHTTPMethod(r, "GET") {
 		s.logError(w, "Invalid HTTP Method", http.StatusMethodNotAllowed)
 		return
@@ -249,22 +316,24 @@ func (s *Server) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Header.Set("Content-Type", "application/json")
-
-	json.NewEncoder(w).Encode(i)
-
-	r.Body = io.NopCloser(bytes.NewReader(body))
-
-	s.Logger.Info("Processed Webhook Request", "user", i.User, "asset", i.Asset, "amount", i.Amount)
-
-	expectedSignature := s.ComputeHmacSignature(time.Now().Unix(), body, nonce, secretKey)
+	expectedSignature := s.ComputeHmacSignature(ts, body, nonce, secretKey)
 
 	if expectedSignature != r.Header.Get("X-Signature") {
 		s.logError(w, "Invalid Signature", http.StatusUnauthorized)
 		return
 	}
 
+	r.Header.Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(i)
+
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	s.Logger.Info("Processed Webhook Request", "user", i.User, "asset", i.Asset, "amount", i.Amount)
 	s.Logger.Info("Valid Webhook Request", "user", i.User, "asset", i.Asset, "amount", i.Amount)
+
+	s.CheckUser(User{Name: i.User, Balances: map[string]string{}})
+
+	s.ModifyUserBalance(i.User, i.Asset, i.Amount, w)
 }
 
 // Admin Endpoint only
