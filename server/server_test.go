@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -984,5 +985,105 @@ func TestModifyUserBalanceScenarios(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestGenerateRequestID_Unique(t *testing.T) {
+	s := NewServer(":0", nil)
+	id1 := s.GenerateRequestID()
+	id2 := s.GenerateRequestID()
+
+	if id1 == "" || id2 == "" {
+		t.Fatal("expected non-empty request IDs")
+	}
+	if id1 == id2 {
+		t.Fatalf("expected unique request IDs, got %q and %q", id1, id2)
+	}
+}
+
+func TestLoggingMiddleware_EmitsTelemetryAndRequestID(t *testing.T) {
+	s := NewServer(":0", nil)
+	var buf bytes.Buffer
+	s.Logger = *slog.New(slog.NewJSONHandler(&buf, nil))
+
+	h := s.LoggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d", rr.Code)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 log lines, got %d: %s", len(lines), buf.String())
+	}
+
+	var startLog, endLog map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &startLog); err != nil {
+		t.Fatalf("failed to parse first log line: %v", err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &endLog); err != nil {
+		t.Fatalf("failed to parse second log line: %v", err)
+	}
+
+	requestIDStart, ok := startLog["request_id"].(string)
+	if !ok || requestIDStart == "" {
+		t.Fatalf("expected request_id in start log, got %#v", startLog["request_id"])
+	}
+	requestIDEnd, ok := endLog["request_id"].(string)
+	if !ok || requestIDEnd == "" {
+		t.Fatalf("expected request_id in end log, got %#v", endLog["request_id"])
+	}
+	if requestIDStart != requestIDEnd {
+		t.Fatalf("expected same request_id across logs, got %q and %q", requestIDStart, requestIDEnd)
+	}
+
+	if startLog["method"] != "GET" {
+		t.Fatalf("expected method GET in start log, got %#v", startLog["method"])
+	}
+	if startLog["path"] != "/test" {
+		t.Fatalf("expected path /test in start log, got %#v", startLog["path"])
+	}
+
+	status, ok := endLog["status"].(float64)
+	if !ok || int(status) != http.StatusAccepted {
+		t.Fatalf("expected status 202 in end log, got %#v", endLog["status"])
+	}
+	if _, ok := endLog["duration_ms"].(float64); !ok {
+		t.Fatalf("expected duration_ms in end log, got %#v", endLog["duration_ms"])
+	}
+}
+
+func TestLogRequestError_IncludesRequestIDAndError(t *testing.T) {
+	s := NewServer(":0", nil)
+	var buf bytes.Buffer
+	s.Logger = *slog.New(slog.NewJSONHandler(&buf, nil))
+
+	req := httptest.NewRequest("GET", "/error", nil)
+	requestID := s.GenerateRequestID()
+	s.LogRequestError(req, requestID, "failure occurred", http.StatusInternalServerError, fmt.Errorf("boom"))
+
+	line := strings.TrimSpace(buf.String())
+	var errLog map[string]any
+	if err := json.Unmarshal([]byte(line), &errLog); err != nil {
+		t.Fatalf("failed to parse error log: %v", err)
+	}
+
+	if errLog["request_id"] != requestID {
+		t.Fatalf("expected request_id %q, got %#v", requestID, errLog["request_id"])
+	}
+	if errLog["status"] != float64(http.StatusInternalServerError) {
+		t.Fatalf("expected status 500, got %#v", errLog["status"])
+	}
+	if errLog["error"] != "boom" {
+		t.Fatalf("expected error boom, got %#v", errLog["error"])
 	}
 }

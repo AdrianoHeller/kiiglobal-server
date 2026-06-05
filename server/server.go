@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -76,6 +77,77 @@ func NewServer(port string, handler http.Handler) *Server {
 		},
 		AdminKey: os.Getenv("ADMIN_KEY"),
 	}
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode   int
+	bytesWritten int
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(statusCode int) {
+	lrw.statusCode = statusCode
+	lrw.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (lrw *loggingResponseWriter) Write(b []byte) (int, error) {
+	if lrw.statusCode == 0 {
+		lrw.statusCode = http.StatusOK
+	}
+	n, err := lrw.ResponseWriter.Write(b)
+	lrw.bytesWritten += n
+	return n, err
+}
+
+func (s *Server) GenerateRequestID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+func (s *Server) WithRequestLogger(r *http.Request, requestID string) *slog.Logger {
+	return s.Logger.With(
+		"request_id", requestID,
+		"method", r.Method,
+		"path", r.URL.Path,
+		"remote_addr", r.RemoteAddr,
+	)
+}
+
+func (s *Server) LogRequestStart(r *http.Request, requestID string) {
+	s.WithRequestLogger(r, requestID).Info("Incoming request", "timestamp", time.Now().UTC().Format(time.RFC3339))
+}
+
+func (s *Server) LogRequestEnd(r *http.Request, requestID string, status int, duration time.Duration) {
+	s.WithRequestLogger(r, requestID).Info("Completed request",
+		"status", status,
+		"duration_ms", duration.Milliseconds(),
+	)
+}
+
+func (s *Server) LogRequestError(r *http.Request, requestID string, message string, status int, err error) {
+	fields := []any{"status", status}
+	if err != nil {
+		fields = append(fields, "error", err.Error())
+	}
+	s.WithRequestLogger(r, requestID).Error(message, fields...)
+}
+
+func (s *Server) LoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := s.GenerateRequestID()
+		lrw := &loggingResponseWriter{ResponseWriter: w}
+		start := time.Now()
+
+		s.LogRequestStart(r, requestID)
+
+		next.ServeHTTP(lrw, r)
+
+		duration := time.Since(start)
+		s.LogRequestEnd(r, requestID, lrw.statusCode, duration)
+	})
 }
 
 // HTTP functions

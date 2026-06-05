@@ -80,7 +80,7 @@ docker compose -f docker-compose-dev.yml down
 
 API routes
 
-- `POST /webhook` — receives HMAC-authenticated webhook payloads and updates user balances.
+- `POST /webhook` — private, HMAC-authenticated webhook payload endpoint that updates user balances.
 - `GET /users` — admin-only endpoint that returns all users.
 - `GET /balance/{user}` — admin-only endpoint that returns an individual user with balances.
 - `GET /ledger` — admin-only endpoint that returns the transaction ledger.
@@ -92,7 +92,13 @@ Request signing
 - `X-Timestamp` — UNIX seconds timestamp used for replay protection.
 - `X-Nonce` — unique nonce per request.
 - `X-Signature` — HMAC-SHA256 signature of `timestamp`, `nonce`, and request body.
-- `X-Admin-Key` — required for admin endpoints.
+- `X-Admin-Key` — required for `/webhook` and admin endpoints.
+
+Telemetry and logging
+
+- All incoming requests are wrapped with structured request telemetry.
+- Each request is assigned a `request_id` for correlation across request start/end logs.
+- Logs include request method, path, remote address, status, and duration.
 
 Admin requests must include `X-Admin-Key`, `X-Signature`, and `X-Nonce` headers.
 

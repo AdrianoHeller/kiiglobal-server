@@ -29,14 +29,14 @@ func main() {
 		s.SetSecretKey(accessKey, secretKey)
 	}
 
-	//Public Endpoints
-	mux.HandleFunc("/webhook", s.WebhookHandler)
+	// Private Endpoints
+	mux.Handle("/webhook", s.LoggingMiddleware(http.HandlerFunc(s.WebhookHandler)))
 
 	//Admin Endpoints
-	mux.HandleFunc("/nonces", s.NonceHandler)
-	mux.HandleFunc("/users", s.UserHandler)
-	mux.HandleFunc("/balance/", s.UserDetailHandler)
-	mux.HandleFunc("/ledger", s.LedgerHandler)
+	mux.Handle("/nonces", s.LoggingMiddleware(http.HandlerFunc(s.NonceHandler)))
+	mux.Handle("/users", s.LoggingMiddleware(http.HandlerFunc(s.UserHandler)))
+	mux.Handle("/balance/", s.LoggingMiddleware(http.HandlerFunc(s.UserDetailHandler)))
+	mux.Handle("/ledger", s.LoggingMiddleware(http.HandlerFunc(s.LedgerHandler)))
 
 	s.Logger.Info("Server Running")
 
