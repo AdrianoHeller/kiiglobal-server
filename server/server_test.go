@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1085,5 +1086,103 @@ func TestLogRequestError_IncludesRequestIDAndError(t *testing.T) {
 	}
 	if errLog["error"] != "boom" {
 		t.Fatalf("expected error boom, got %#v", errLog["error"])
+	}
+}
+
+func TestInitSecretKeyOnce_Concurrent(t *testing.T) {
+	s := NewServer(":0", nil)
+	const accessKey = "test-access"
+	const secret = "secret123"
+	var wg sync.WaitGroup
+	errs := make(chan error, 10)
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.InitSecretKeyOnce(accessKey, secret)
+			got, ok := s.GetSecretKey(accessKey)
+			if !ok {
+				errs <- fmt.Errorf("expected access key to exist")
+				return
+			}
+			if got != secret {
+				errs <- fmt.Errorf("expected secret %q, got %q", secret, got)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
+func TestGetAllUsersReturnsDeepCopy(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.Users = []User{{Name: "Alice", Balances: map[string]string{"Gold": "10.00"}}}
+
+	users := s.GetAllUsers()
+	users[0].Balances["Gold"] = "0.00"
+
+	if s.Users[0].Balances["Gold"] != "10.00" {
+		t.Fatalf("expected original user balance to remain 10.00, got %q", s.Users[0].Balances["Gold"])
+	}
+}
+
+func TestGetUserReturnsDeepCopy(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.Users = []User{{Name: "Alice", Balances: map[string]string{"Gold": "10.00"}}}
+
+	user, ok := s.GetUser("Alice")
+	if !ok {
+		t.Fatal("expected user Alice to exist")
+	}
+
+	user.Balances["Gold"] = "0.00"
+
+	orig, ok := s.GetUser("Alice")
+	if !ok {
+		t.Fatal("expected original user Alice to still exist")
+	}
+	if orig.Balances["Gold"] != "10.00" {
+		t.Fatalf("expected original balance to remain 10.00, got %q", orig.Balances["Gold"])
+	}
+}
+
+func TestGetAllUsersConcurrentReadDuringUpdate(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.Users = []User{{Name: "Alice", Balances: map[string]string{"Gold": "0.00"}}}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				_ = s.GetAllUsers()
+			}
+		}()
+	}
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				_ = s.ModifyUserBalance("Alice", "Gold", "1.00", httptest.NewRecorder())
+			}
+		}()
+	}
+
+	wg.Wait()
+	user, ok := s.GetUser("Alice")
+	if !ok {
+		t.Fatal("expected user Alice to exist")
+	}
+	if user.Balances["Gold"] == "0.00" {
+		t.Fatal("expected balance to be updated by concurrent writes")
 	}
 }

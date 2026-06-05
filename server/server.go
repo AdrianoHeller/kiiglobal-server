@@ -184,6 +184,42 @@ func (s *Server) SetSecretKey(accessKey, secretKey string) {
 	s.Vault.Credentials[accessKey] = secretKey
 }
 
+func (s *Server) InitSecretKeyOnce(accessKey, secretKey string) {
+	s.Vault.Mu.Lock()
+	defer s.Vault.Mu.Unlock()
+
+	if len(s.Vault.Credentials) == 0 {
+		s.Vault.Credentials[accessKey] = secretKey
+	}
+}
+
+func copyBalances(src map[string]string) map[string]string {
+	if src == nil {
+		return nil
+	}
+
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func copyUser(user User) User {
+	return User{
+		Name:     user.Name,
+		Balances: copyBalances(user.Balances),
+	}
+}
+
+func copyUsers(users []User) []User {
+	out := make([]User, len(users))
+	for i, user := range users {
+		out[i] = copyUser(user)
+	}
+	return out
+}
+
 func (s *Server) AddNonceFromRequest(nonce string) {
 
 	s.NonceVault.Mu.Lock()
@@ -278,7 +314,7 @@ func (s *Server) GetUser(name string) (User, bool) {
 
 	for _, u := range s.Users {
 		if u.Name == name {
-			return u, true
+			return copyUser(u), true
 		}
 	}
 	return User{}, false
@@ -288,7 +324,7 @@ func (s *Server) GetAllUsers() []User {
 	s.Vault.Mu.RLock()
 	defer s.Vault.Mu.RUnlock()
 
-	return s.Users
+	return copyUsers(s.Users)
 }
 
 func (s *Server) RecordTransaction(tx Transaction) {
@@ -405,11 +441,8 @@ func (s *Server) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 	timestamp := r.Header.Get("X-Timestamp")
 	nonce := r.Header.Get("X-Nonce")
 
-	//Check if credentials vault are empty
-	if len(s.Vault.Credentials) == 0 {
-		// For the first run as testing purposes, we will set the secret key in the vault directly from environment variables. In production, this should be set through a secure admin endpoint and stored in a secure vault.
-		s.SetSecretKey(accessKey, os.Getenv("SECRET_KEY"))
-	}
+	// Ensure the vault is initialized once in a concurrency-safe way.
+	s.InitSecretKeyOnce(accessKey, os.Getenv("SECRET_KEY"))
 
 	//Get Secret Key from Vault
 	secretKey, exists := s.GetSecretKey(accessKey)
@@ -531,7 +564,7 @@ func (s *Server) UserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	json.NewEncoder(w).Encode(s.Users)
+	json.NewEncoder(w).Encode(s.GetAllUsers())
 }
 
 func (s *Server) UserDetailHandler(w http.ResponseWriter, r *http.Request) {

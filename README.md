@@ -43,7 +43,7 @@ ACCESS_KEY=your-access SECRET_KEY=your-secret SERVER_URL=http://localhost:5001 g
 
 Run the local integration helper
 
-A helper script is available at `scripts/run_local.sh`. It runs all tests first, exports verbose test output to `test_results.txt`, then starts the server and runs the client if tests pass.
+A helper script is available at `scripts/run_local.sh`. It runs all tests first, exports verbose test output to `test_results.txt`, then starts the server, waits for the port to become available, and runs the client if tests pass. Server output is written to `server.log` while the script runs.
 
 ```bash
 chmod +x scripts/run_local.sh
@@ -116,10 +116,10 @@ If `TIMESTAMP_AGE` is missing or invalid, the server uses a default of `5m`.
 
 Testing
 
-- Run `go test ./... -v` for verbose test output.
+- Run `go test ./... -v` for verbose test output locally.
 - The project also uses `go vet ./...` during Docker builds for additional static checks.
-- The local runner `scripts/run_local.sh` runs tests first and writes all results to `test_results.txt`.
-- The Docker Compose `tests` service also runs `go test ./... -v | tee test_results.txt`.
+- The local runner `scripts/run_local.sh` runs `go test ./... -v` first and writes all results to `test_results.txt`, then starts the server and executes the client.
+- The Docker Compose `tests` service also runs `go test ./... -v | tee test_results.txt` inside the container.
 
 Troubleshooting
 

@@ -10,11 +10,10 @@ import (
 func main() {
 
 	serverPort := os.Getenv("SERVER_PORT")
-	serverPort = ":" + serverPort
-
 	if serverPort == "" {
-		serverPort = ":5001"
+		serverPort = "5001"
 	}
+	serverPort = ":" + serverPort
 
 	mux := http.NewServeMux()
 
