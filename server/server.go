@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -71,14 +72,13 @@ func (s *Server) ValidateAdminAccess(key string, r *http.Request) bool {
 	return adminKey == s.AdminKey && key != ""
 }
 
-func (s *Server) validateHeaders(req *http.Request) bool {
+func (s *Server) validateHeaders(w http.ResponseWriter, req *http.Request) bool {
 
 	signature := req.Header.Get("X-Signature")
 	nonce := req.Header.Get("X-Nonce")
 
-	// Missing Signature or Nonce
 	if signature == "" || nonce == "" {
-		s.Logger.Error("Empty Validation Data", "error", http.StatusUnauthorized)
+		s.logError(w, "Missing signature or nonce", http.StatusUnauthorized)
 		return false
 	}
 	return true
@@ -275,7 +275,7 @@ func (s *Server) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.validateHeaders(r) {
+	if !s.validateHeaders(w, r) {
 		return
 	}
 
@@ -345,7 +345,7 @@ func (s *Server) UserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.validateHeaders(r) {
+	if !s.validateHeaders(w, r) {
 		return
 	}
 
@@ -357,6 +357,44 @@ func (s *Server) UserHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(s.Users)
 }
 
+func (s *Server) UserDetailHandler(w http.ResponseWriter, r *http.Request) {
+	r.Header.Set("Content-Type", "application/json")
+
+	if !s.ValidateAdminAccess(s.AdminKey, r) {
+		s.logError(w, "Unauthorized Access", http.StatusUnauthorized)
+		return
+	}
+
+	if !s.validateHeaders(w, r) {
+		return
+	}
+
+	if !s.CheckHTTPMethod(r, "GET") {
+		s.logError(w, "Invalid HTTP Method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	pathPrefix := "/balance/"
+	if !strings.HasPrefix(r.URL.Path, pathPrefix) {
+		s.logError(w, "Invalid user path", http.StatusBadRequest)
+		return
+	}
+
+	userName := strings.TrimPrefix(r.URL.Path, pathPrefix)
+	if userName == "" {
+		s.logError(w, "Missing user name", http.StatusBadRequest)
+		return
+	}
+
+	user, found := s.GetUser(userName)
+	if !found {
+		s.logError(w, "User not found", http.StatusNotFound)
+		return
+	}
+
+	json.NewEncoder(w).Encode(user)
+}
+
 // NonceHandler returns the stored nonces (admin-only)
 func (s *Server) NonceHandler(w http.ResponseWriter, r *http.Request) {
 	r.Header.Set("Content-Type", "application/json")
@@ -366,7 +404,7 @@ func (s *Server) NonceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.validateHeaders(r) {
+	if !s.validateHeaders(w, r) {
 		return
 	}
 

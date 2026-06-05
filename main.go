@@ -35,6 +35,7 @@ func main() {
 	//Admin Endpoints
 	mux.HandleFunc("/nonces", s.NonceHandler)
 	mux.HandleFunc("/users", s.UserHandler)
+	mux.HandleFunc("/balance/", s.UserDetailHandler)
 
 	s.Logger.Info("Server Running")
 

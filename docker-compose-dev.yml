@@ -1,0 +1,29 @@
+services:
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5001:5001"
+    restart: unless-stopped
+    environment:
+      SERVER_PORT: "5001"
+      ADMIN_KEY: "admin-secret"
+      ACCESS_KEY: "local-access"
+      SECRET_KEY: "local-secret"
+      TIMESTAMP_AGE: "5m"
+      SERVER_URL: "http://localhost:5001"
+    volumes:
+      - ./:/usr/src/app
+    command: ["/usr/local/bin/app"]
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /usr/src/app
+    volumes:
+      - ./:/usr/src/app
+    command: ["/bin/bash", "-lc", "go test ./... -v | tee test_results.txt"]
+    restart: "no"

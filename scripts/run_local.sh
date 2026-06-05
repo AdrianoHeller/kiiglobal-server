@@ -16,6 +16,17 @@ export SERVER_PORT ADMIN_KEY TIMESTAMP_AGE ACCESS_KEY SECRET_KEY SERVER_URL
 
 echo "ENV: SERVER_PORT=$SERVER_PORT ADMIN_KEY=$ADMIN_KEY TIMESTAMP_AGE=$TIMESTAMP_AGE"
 
+RESULTS_FILE="test_results.txt"
+
+# Run tests before starting services, stream verbose output, and export all output to a file
+echo "Running tests and exporting results to ${RESULTS_FILE}..."
+if ! go test ./... -v 2>&1 | tee "${RESULTS_FILE}"; then
+  echo "Tests failed. See ${RESULTS_FILE} for details."
+  exit 1
+fi
+
+echo "Tests passed. Starting server..."
+
 # Start server in background and capture PID
 echo "Starting server (go run main.go)..."
 nohup go run main.go > server.log 2>&1 &
