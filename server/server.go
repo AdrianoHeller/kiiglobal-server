@@ -100,6 +100,25 @@ func (s *Server) SetSecretKey(accessKey, secretKey string) {
 	s.Vault.Credentials[accessKey] = secretKey
 }
 
+func (s *Server) AddNonceFromRequest(nonce string) {
+
+	s.NonceVault.Mu.Lock()
+	defer s.NonceVault.Mu.Unlock()
+
+	s.NonceVault.Nonces[nonce] = time.Now()
+}
+
+func (s *Server) CheckNonce(nonce string) bool {
+
+	s.NonceVault.Mu.RLock()
+	defer s.NonceVault.Mu.RUnlock()
+
+	if _, exists := s.NonceVault.Nonces[nonce]; exists {
+		return false
+	}
+	return true
+}
+
 func (s *Server) GetSecretKey(accessKey string) (string, bool) {
 
 	s.Vault.Mu.RLock()
@@ -172,6 +191,12 @@ func (s *Server) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 	timestamp := r.Header.Get("X-Timestamp")
 	nonce := r.Header.Get("X-Nonce")
 
+	//Check if credentials vault are empty
+	if len(s.Vault.Credentials) == 0 {
+		// For the first run as testing purposes, we will set the secret key in the vault directly from environment variables. In production, this should be set through a secure admin endpoint and stored in a secure vault.
+		s.SetSecretKey(accessKey, os.Getenv("SECRET_KEY"))
+	}
+
 	//Get Secret Key from Vault
 	secretKey, exists := s.GetSecretKey(accessKey)
 
@@ -202,6 +227,13 @@ func (s *Server) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 		s.logError(w, "Invalid HTTP Method", http.StatusMethodNotAllowed)
 		return
 	}
+
+	if !s.CheckNonce(nonce) {
+		s.logError(w, "Nonce Already Used", http.StatusUnauthorized)
+		return
+	}
+
+	s.AddNonceFromRequest(nonce)
 
 	i := Input{}
 
