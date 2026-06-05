@@ -20,6 +20,15 @@ func main() {
 
 	s := server.NewServer(serverPort, mux)
 
+	// If ACCESS_KEY and SECRET_KEY are provided in the environment, register
+	// them in the server's in-memory vault so incoming requests from the
+	// local `cmd/client` can be validated.
+	accessKey := os.Getenv("ACCESS_KEY")
+	secretKey := os.Getenv("SECRET_KEY")
+	if accessKey != "" && secretKey != "" {
+		s.SetSecretKey(accessKey, secretKey)
+	}
+
 	//Public Endpoints
 	mux.HandleFunc("/webhook", s.WebhookHandler)
 
