@@ -74,6 +74,78 @@ func TestWebhookHandler_Success(t *testing.T) {
 	}
 }
 
+func TestWebhookHandler_PrecisionDecimalAmount(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.SetSecretKey("test-access", "secret123")
+	s.AdminKey = "admin-secret"
+
+	body := []byte(`{"user":"Alice","asset":"Gold","amount":0.1}`)
+	nonce, err := client.GenerateNonce(16)
+	if err != nil {
+		t.Fatalf("failed to generate nonce: %v", err)
+	}
+	ts := time.Now().Unix()
+	sig := s.ComputeHmacSignature(ts, body, nonce, "secret123")
+
+	req := httptest.NewRequest("GET", "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Access-Key", "test-access")
+	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", ts))
+	req.Header.Set("X-Nonce", nonce)
+	req.Header.Set("X-Signature", sig)
+	req.Header.Set("X-Admin-Key", s.AdminKey)
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.WebhookHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	user, found := s.GetUser("Alice")
+	if !found {
+		t.Fatal("expected user Alice to exist")
+	}
+	if user.Balances["Gold"] != "0.10" {
+		t.Fatalf("expected precise balance 0.10, got %q", user.Balances["Gold"])
+	}
+}
+
+func TestCheckUserDoesNotOverwriteBalances(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.Users = []User{{Name: "Alice", Balances: map[string]string{"Gold": "10.00"}}}
+
+	s.CheckUser(User{Name: "Alice", Balances: map[string]string{}})
+
+	user, found := s.GetUser("Alice")
+	if !found {
+		t.Fatal("expected user Alice to still exist")
+	}
+	if user.Balances["Gold"] != "10.00" {
+		t.Fatalf("expected existing balance to remain 10.00, got %q", user.Balances["Gold"])
+	}
+}
+
+func TestModifyUserBalancePrecision(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.Users = []User{{Name: "Alice", Balances: map[string]string{"Gold": "0.00"}}}
+	w := httptest.NewRecorder()
+
+	if !s.ModifyUserBalance("Alice", "Gold", "0.10", w) {
+		t.Fatal("expected first update to succeed")
+	}
+	if !s.ModifyUserBalance("Alice", "Gold", "0.20", w) {
+		t.Fatal("expected second update to succeed")
+	}
+
+	user, found := s.GetUser("Alice")
+	if !found {
+		t.Fatal("expected user Alice to exist")
+	}
+	if user.Balances["Gold"] != "0.30" {
+		t.Fatalf("expected precise balance 0.30, got %q", user.Balances["Gold"])
+	}
+}
+
 func TestUserDetailHandler_ReturnsUserWithBalances(t *testing.T) {
 	s := NewServer(":0", nil)
 	s.AdminKey = "admin-secret"
@@ -518,7 +590,8 @@ func TestModifyUserBalanceScenarios(t *testing.T) {
 			}
 			w := httptest.NewRecorder()
 
-			ok := s.ModifyUserBalance(tc.userName, tc.asset, tc.amount, w)
+			amountStr := fmt.Sprintf("%.2f", tc.amount)
+			ok := s.ModifyUserBalance(tc.userName, tc.asset, amountStr, w)
 			if ok != tc.wantOK {
 				t.Fatalf("expected ok=%v, got %v, body=%q", tc.wantOK, ok, w.Body.String())
 			}

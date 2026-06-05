@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"os"
 	"strconv"
@@ -28,9 +29,9 @@ type NonceVault struct {
 }
 
 type Input struct {
-	User   string  `json:"user"`
-	Asset  string  `json:"asset"`
-	Amount float64 `json:"amount"`
+	User   string      `json:"user"`
+	Asset  string      `json:"asset"`
+	Amount json.Number `json:"amount"`
 }
 
 type User struct {
@@ -128,14 +129,50 @@ func (s *Server) GetSecretKey(accessKey string) (string, bool) {
 	return secretKey, exists
 }
 
+func parseDecimal(value string) (*big.Float, error) {
+	f, ok := new(big.Float).SetPrec(128).SetMode(big.ToNearestEven).SetString(value)
+	if !ok {
+		return nil, fmt.Errorf("invalid decimal value: %q", value)
+	}
+	return f, nil
+}
+
+func formatDecimal(value *big.Float) string {
+	return value.Text('f', 2)
+}
+
+func addDecimals(a, b string) (string, error) {
+	aFloat, err := parseDecimal(a)
+	if err != nil {
+		return "", err
+	}
+	bFloat, err := parseDecimal(b)
+	if err != nil {
+		return "", err
+	}
+	result := new(big.Float).SetPrec(128).SetMode(big.ToNearestEven)
+	result.Add(aFloat, bFloat)
+	return formatDecimal(result), nil
+}
+
+func compareDecimals(a, b string) (int, error) {
+	aFloat, err := parseDecimal(a)
+	if err != nil {
+		return 0, err
+	}
+	bFloat, err := parseDecimal(b)
+	if err != nil {
+		return 0, err
+	}
+	return aFloat.Cmp(bFloat), nil
+}
+
 func (s *Server) CheckUser(user User) {
 
 	s.Vault.Mu.Lock()
 	defer s.Vault.Mu.Unlock()
-	// Check if user already exists
-	for i, u := range s.Users {
+	for _, u := range s.Users {
 		if u.Name == user.Name {
-			s.Users[i] = user
 			return
 		}
 	}
@@ -163,7 +200,7 @@ func (s *Server) GetAllUsers() []User {
 	return s.Users
 }
 
-func (s *Server) ModifyUserBalance(userName, asset string, amount float64, w http.ResponseWriter) bool {
+func (s *Server) ModifyUserBalance(userName, asset, amountStr string, w http.ResponseWriter) bool {
 
 	s.Vault.Mu.Lock()
 	defer s.Vault.Mu.Unlock()
@@ -173,16 +210,25 @@ func (s *Server) ModifyUserBalance(userName, asset string, amount float64, w htt
 				s.Users[i].Balances = make(map[string]string)
 			}
 			currentBalanceStr, exists := u.Balances[asset]
-			var currentBalance float64
-			if exists {
-				currentBalance, _ = strconv.ParseFloat(currentBalanceStr, 64)
+			if !exists {
+				currentBalanceStr = "0.00"
 			}
-			if currentBalance+amount < 0 {
+
+			newBalance, err := addDecimals(currentBalanceStr, amountStr)
+			if err != nil {
+				s.logError(w, "Invalid amount or balance format", http.StatusBadRequest)
+				return false
+			}
+
+			if cmp, err := compareDecimals(newBalance, "0.00"); err != nil {
+				s.logError(w, "Invalid balance calculation", http.StatusInternalServerError)
+				return false
+			} else if cmp < 0 {
 				s.logError(w, fmt.Sprintf("Invalid balance in the %s for the User to perform the transaction", asset), http.StatusBadRequest)
 				return false
 			}
-			newBalance := currentBalance + amount
-			s.Users[i].Balances[asset] = fmt.Sprintf("%.2f", newBalance)
+
+			s.Users[i].Balances[asset] = newBalance
 			return true
 		}
 	}
@@ -305,14 +351,24 @@ func (s *Server) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 	i := Input{}
 
 	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.logError(w, "Error reading request body", http.StatusInternalServerError)
+		return
+	}
 
 	if err := json.Unmarshal(body, &i); err != nil {
 		s.logError(w, "Error parsing request body", http.StatusBadRequest)
 		return
 	}
 
-	if err != nil {
-		s.logError(w, "Error reading request body", http.StatusInternalServerError)
+	if i.User == "" || i.Asset == "" || i.Amount == "" {
+		s.logError(w, "Missing request payload fields", http.StatusBadRequest)
+		return
+	}
+
+	amountStr := i.Amount.String()
+	if _, err := parseDecimal(amountStr); err != nil {
+		s.logError(w, "Invalid amount format", http.StatusBadRequest)
 		return
 	}
 
@@ -333,7 +389,7 @@ func (s *Server) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	s.CheckUser(User{Name: i.User, Balances: map[string]string{}})
 
-	s.ModifyUserBalance(i.User, i.Asset, i.Amount, w)
+	s.ModifyUserBalance(i.User, i.Asset, amountStr, w)
 }
 
 // Admin Endpoint only
