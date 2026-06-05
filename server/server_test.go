@@ -49,7 +49,7 @@ func TestWebhookHandler_Success(t *testing.T) {
 	ts := time.Now().Unix()
 	sig := s.ComputeHmacSignature(ts, body, nonce, secret)
 
-	req := httptest.NewRequest("GET", "/webhook", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-Access-Key", accessKey)
 	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", ts))
 	req.Header.Set("X-Nonce", nonce)
@@ -65,12 +65,12 @@ func TestWebhookHandler_Success(t *testing.T) {
 		t.Fatalf("expected 200 OK, got %d, body: %s", rr.Code, rr.Body.String())
 	}
 
-	var got map[string]interface{}
+	var got Input
 	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
 		t.Fatalf("failed to parse response body: %v", err)
 	}
-	if got["user"] != "Alice" {
-		t.Fatalf("unexpected response JSON: %v", got)
+	if got.User != "Alice" || got.Asset != "Gold" || got.Amount.String() != "10" {
+		t.Fatalf("unexpected input response: %#v", got)
 	}
 }
 
@@ -87,7 +87,7 @@ func TestWebhookHandler_PrecisionDecimalAmount(t *testing.T) {
 	ts := time.Now().Unix()
 	sig := s.ComputeHmacSignature(ts, body, nonce, "secret123")
 
-	req := httptest.NewRequest("GET", "/webhook", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-Access-Key", "test-access")
 	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", ts))
 	req.Header.Set("X-Nonce", nonce)
@@ -107,6 +107,107 @@ func TestWebhookHandler_PrecisionDecimalAmount(t *testing.T) {
 	}
 	if user.Balances["Gold"] != "0.10" {
 		t.Fatalf("expected precise balance 0.10, got %q", user.Balances["Gold"])
+	}
+}
+
+func TestWebhookHandler_RecordsLedgerTransaction(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.SetSecretKey("test-access", "secret123")
+	s.AdminKey = "admin-secret"
+
+	body := []byte(`{"user":"Alice","asset":"Gold","amount":0.1}`)
+	nonce, err := client.GenerateNonce(16)
+	if err != nil {
+		t.Fatalf("failed to generate nonce: %v", err)
+	}
+	ts := time.Now().Unix()
+	sig := s.ComputeHmacSignature(ts, body, nonce, "secret123")
+
+	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Access-Key", "test-access")
+	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", ts))
+	req.Header.Set("X-Nonce", nonce)
+	req.Header.Set("X-Signature", sig)
+	req.Header.Set("X-Admin-Key", s.AdminKey)
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.WebhookHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	ledger := s.GetLedger()
+	if len(ledger) != 1 {
+		t.Fatalf("expected 1 ledger entry, got %d", len(ledger))
+	}
+	if ledger[0].User != "Alice" || ledger[0].Asset != "Gold" || ledger[0].Amount != "0.10" {
+		t.Fatalf("unexpected ledger entry: %#v", ledger[0])
+	}
+	if ledger[0].Signature != sig {
+		t.Fatalf("expected request signature %q, got %q", sig, ledger[0].Signature)
+	}
+	if ledger[0].PreviousTransactionSignature != "" {
+		t.Fatalf("expected empty previous transaction signature, got %q", ledger[0].PreviousTransactionSignature)
+	}
+}
+
+func TestWebhookHandler_RecordsPreviousTransactionSignature(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.SetSecretKey("test-access", "secret123")
+	s.AdminKey = "admin-secret"
+
+	body1 := []byte(`{"user":"Alice","asset":"Gold","amount":0.1}`)
+	nonce1, err := client.GenerateNonce(16)
+	if err != nil {
+		t.Fatalf("failed to generate nonce: %v", err)
+	}
+	ts1 := time.Now().Unix()
+	sig1 := s.ComputeHmacSignature(ts1, body1, nonce1, "secret123")
+
+	req1 := httptest.NewRequest("POST", "/webhook", bytes.NewReader(body1))
+	req1.Header.Set("X-Access-Key", "test-access")
+	req1.Header.Set("X-Timestamp", fmt.Sprintf("%d", ts1))
+	req1.Header.Set("X-Nonce", nonce1)
+	req1.Header.Set("X-Signature", sig1)
+	req1.Header.Set("X-Admin-Key", s.AdminKey)
+
+	rr1 := httptest.NewRecorder()
+	http.HandlerFunc(s.WebhookHandler).ServeHTTP(rr1, req1)
+	if rr1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for first request, got %d, body=%s", rr1.Code, rr1.Body.String())
+	}
+
+	body2 := []byte(`{"user":"Alice","asset":"Gold","amount":0.2}`)
+	nonce2, err := client.GenerateNonce(16)
+	if err != nil {
+		t.Fatalf("failed to generate nonce: %v", err)
+	}
+	ts2 := time.Now().Add(1 * time.Second).Unix()
+	sig2 := s.ComputeHmacSignature(ts2, body2, nonce2, "secret123")
+
+	req2 := httptest.NewRequest("POST", "/webhook", bytes.NewReader(body2))
+	req2.Header.Set("X-Access-Key", "test-access")
+	req2.Header.Set("X-Timestamp", fmt.Sprintf("%d", ts2))
+	req2.Header.Set("X-Nonce", nonce2)
+	req2.Header.Set("X-Signature", sig2)
+	req2.Header.Set("X-Admin-Key", s.AdminKey)
+
+	rr2 := httptest.NewRecorder()
+	http.HandlerFunc(s.WebhookHandler).ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for second request, got %d, body=%s", rr2.Code, rr2.Body.String())
+	}
+
+	ledger := s.GetLedger()
+	if len(ledger) != 2 {
+		t.Fatalf("expected 2 ledger entries, got %d", len(ledger))
+	}
+	if ledger[1].Signature != sig2 {
+		t.Fatalf("expected second entry signature %q, got %q", sig2, ledger[1].Signature)
+	}
+	if ledger[1].PreviousTransactionSignature != sig1 {
+		t.Fatalf("expected second entry previous signature %q, got %q", sig1, ledger[1].PreviousTransactionSignature)
 	}
 }
 
@@ -146,6 +247,19 @@ func TestModifyUserBalancePrecision(t *testing.T) {
 	}
 }
 
+func TestModifyUserBalance_InvalidAmountFormat(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.Users = []User{{Name: "Alice", Balances: map[string]string{"Gold": "0.00"}}}
+	w := httptest.NewRecorder()
+
+	if s.ModifyUserBalance("Alice", "Gold", "abc", w) {
+		t.Fatal("expected invalid amount update to fail")
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request status code, got %d", w.Code)
+	}
+}
+
 func TestUserDetailHandler_ReturnsUserWithBalances(t *testing.T) {
 	s := NewServer(":0", nil)
 	s.AdminKey = "admin-secret"
@@ -182,7 +296,7 @@ func TestWebhookHandler_InvalidAccessKey(t *testing.T) {
 	s.AdminKey = "admin-secret"
 
 	body := []byte(`{"user":"Alice","asset":"Gold","amount":10}`)
-	req := httptest.NewRequest("GET", "/webhook", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-Access-Key", "bad-access")
 	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", time.Now().Unix()))
 	req.Header.Set("X-Nonce", "nonce-1")
@@ -203,7 +317,7 @@ func TestWebhookHandler_MissingHeaders(t *testing.T) {
 	s.AdminKey = "admin-secret"
 
 	body := []byte(`{"user":"Alice","asset":"Gold","amount":10}`)
-	req := httptest.NewRequest("GET", "/webhook", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-Access-Key", "test-access")
 	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", time.Now().Unix()))
 	req.Header.Set("X-Admin-Key", s.AdminKey)
@@ -213,6 +327,144 @@ func TestWebhookHandler_MissingHeaders(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 Unauthorized, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestWebhookHandler_InvalidJSONBody(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.SetSecretKey("test-access", "secret123")
+	s.AdminKey = "admin-secret"
+
+	body := []byte(`{"user":"Alice","asset":"Gold","amount":10`)
+	nonce, err := client.GenerateNonce(16)
+	if err != nil {
+		t.Fatalf("failed to generate nonce: %v", err)
+	}
+	ts := time.Now().Unix()
+	sig := s.ComputeHmacSignature(ts, body, nonce, "secret123")
+
+	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Access-Key", "test-access")
+	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", ts))
+	req.Header.Set("X-Nonce", nonce)
+	req.Header.Set("X-Signature", sig)
+	req.Header.Set("X-Admin-Key", s.AdminKey)
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.WebhookHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestWebhookHandler_MissingPayloadFields(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.SetSecretKey("test-access", "secret123")
+	s.AdminKey = "admin-secret"
+
+	body := []byte(`{"user":"","asset":"Gold","amount":10}`)
+	nonce, err := client.GenerateNonce(16)
+	if err != nil {
+		t.Fatalf("failed to generate nonce: %v", err)
+	}
+	ts := time.Now().Unix()
+	sig := s.ComputeHmacSignature(ts, body, nonce, "secret123")
+
+	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Access-Key", "test-access")
+	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", ts))
+	req.Header.Set("X-Nonce", nonce)
+	req.Header.Set("X-Signature", sig)
+	req.Header.Set("X-Admin-Key", s.AdminKey)
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.WebhookHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestWebhookHandler_InvalidTimestampFormat(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.SetSecretKey("test-access", "secret123")
+	s.AdminKey = "admin-secret"
+
+	body := []byte(`{"user":"Alice","asset":"Gold","amount":10}`)
+	nonce, err := client.GenerateNonce(16)
+	if err != nil {
+		t.Fatalf("failed to generate nonce: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Access-Key", "test-access")
+	req.Header.Set("X-Timestamp", "not-a-timestamp")
+	req.Header.Set("X-Nonce", nonce)
+	req.Header.Set("X-Signature", "dummy")
+	req.Header.Set("X-Admin-Key", s.AdminKey)
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.WebhookHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestWebhookHandler_MethodNotAllowed(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.SetSecretKey("test-access", "secret123")
+	s.AdminKey = "admin-secret"
+
+	body := []byte(`{"user":"Alice","asset":"Gold","amount":10}`)
+	nonce, err := client.GenerateNonce(16)
+	if err != nil {
+		t.Fatalf("failed to generate nonce: %v", err)
+	}
+	ts := time.Now().Unix()
+	sig := s.ComputeHmacSignature(ts, body, nonce, "secret123")
+
+	req := httptest.NewRequest("GET", "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Access-Key", "test-access")
+	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", ts))
+	req.Header.Set("X-Nonce", nonce)
+	req.Header.Set("X-Signature", sig)
+	req.Header.Set("X-Admin-Key", s.AdminKey)
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.WebhookHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestWebhookHandler_InvalidAmountFormat(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.SetSecretKey("test-access", "secret123")
+	s.AdminKey = "admin-secret"
+
+	body := []byte(`{"user":"Alice","asset":"Gold","amount":"abc"}`)
+	nonce, err := client.GenerateNonce(16)
+	if err != nil {
+		t.Fatalf("failed to generate nonce: %v", err)
+	}
+	ts := time.Now().Unix()
+	sig := s.ComputeHmacSignature(ts, body, nonce, "secret123")
+
+	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Access-Key", "test-access")
+	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", ts))
+	req.Header.Set("X-Nonce", nonce)
+	req.Header.Set("X-Signature", sig)
+	req.Header.Set("X-Admin-Key", s.AdminKey)
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.WebhookHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request, got %d, body=%s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -242,6 +494,68 @@ func TestUserHandler_ReturnsUsers(t *testing.T) {
 	}
 }
 
+func TestLedgerHandler_ReturnsLedger(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.AdminKey = "admin-secret"
+	s.Ledger = []Transaction{
+		{User: "Alice", Asset: "Gold", Amount: "10.00", Signature: "sig1", PreviousTransactionSignature: ""},
+		{User: "Bob", Asset: "Silver", Amount: "5.50", Signature: "sig2", PreviousTransactionSignature: "sig1"},
+	}
+
+	req := httptest.NewRequest("GET", "/ledger", nil)
+	req.Header.Set("X-Admin-Key", s.AdminKey)
+	req.Header.Set("X-Signature", "dummy")
+	req.Header.Set("X-Nonce", "dummy")
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.LedgerHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	var got []Transaction
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("failed to parse response JSON: %v", err)
+	}
+	if len(got) != 2 || got[0].Signature != "sig1" || got[1].PreviousTransactionSignature != "sig1" {
+		t.Fatalf("unexpected ledger response: %#v", got)
+	}
+}
+
+func TestLedgerHandler_MethodNotAllowed(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.AdminKey = "admin-secret"
+
+	req := httptest.NewRequest("POST", "/ledger", nil)
+	req.Header.Set("X-Admin-Key", s.AdminKey)
+	req.Header.Set("X-Signature", "dummy")
+	req.Header.Set("X-Nonce", "dummy")
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.LedgerHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestLedgerHandler_Unauthorized(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.AdminKey = "admin-secret"
+
+	req := httptest.NewRequest("GET", "/ledger", nil)
+	req.Header.Set("X-Signature", "dummy")
+	req.Header.Set("X-Nonce", "dummy")
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.LedgerHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestUserHandler_Unauthorized(t *testing.T) {
 	s := NewServer(":0", nil)
 	s.Users = []User{{Name: "Alice", Balances: map[string]string{"Gold": "10.00"}}}
@@ -255,6 +569,21 @@ func TestUserHandler_Unauthorized(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 Unauthorized, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUserHandler_MissingSignatureOrNonce(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.AdminKey = "admin-secret"
+
+	req := httptest.NewRequest("GET", "/users", nil)
+	req.Header.Set("X-Admin-Key", s.AdminKey)
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.UserHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized when signature or nonce is missing, got %d, body=%s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -309,6 +638,39 @@ func TestUserDetailHandler_InvalidPath(t *testing.T) {
 	}
 }
 
+func TestUserDetailHandler_Unauthorized(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.AdminKey = "admin-secret"
+
+	req := httptest.NewRequest("GET", "/balance/Alice", nil)
+	req.Header.Set("X-Signature", "dummy")
+	req.Header.Set("X-Nonce", "dummy")
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.UserDetailHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUserDetailHandler_MethodNotAllowed(t *testing.T) {
+	s := NewServer(":0", nil)
+	s.AdminKey = "admin-secret"
+
+	req := httptest.NewRequest("POST", "/balance/Alice", nil)
+	req.Header.Set("X-Admin-Key", s.AdminKey)
+	req.Header.Set("X-Signature", "dummy")
+	req.Header.Set("X-Nonce", "dummy")
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.UserDetailHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestNonceHandler_Success(t *testing.T) {
 	s := NewServer(":0", nil)
 	s.AdminKey = "admin-secret"
@@ -352,6 +714,21 @@ func TestNonceHandler_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestNonceHandler_Unauthorized(t *testing.T) {
+	s := NewServer(":0", nil)
+
+	req := httptest.NewRequest("GET", "/nonces", nil)
+	req.Header.Set("X-Signature", "dummy")
+	req.Header.Set("X-Nonce", "dummy")
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(s.NonceHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func makeSignedWebhookRequest(t *testing.T, body []byte, accessKey, secretKey, adminKey string, ts int64, nonce string) *http.Request {
 	t.Helper()
 	if nonce == "" {
@@ -371,7 +748,7 @@ func makeSignedWebhookRequest(t *testing.T, body []byte, accessKey, secretKey, a
 	mac.Write([]byte(canonical))
 	sig := hex.EncodeToString(mac.Sum(nil))
 
-	req := httptest.NewRequest("GET", "/webhook", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-Access-Key", accessKey)
 	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", ts))
 	req.Header.Set("X-Nonce", nonce)
@@ -459,7 +836,7 @@ func TestWebhookHandler_HMACValidationScenarios(t *testing.T) {
 
 			var req *http.Request
 			if tc.signature != "" {
-				req = httptest.NewRequest("GET", "/webhook", bytes.NewReader(body))
+				req = httptest.NewRequest("POST", "/webhook", bytes.NewReader(body))
 				req.Header.Set("X-Access-Key", accessKey)
 				req.Header.Set("X-Timestamp", fmt.Sprintf("%d", tc.timestamp))
 				req.Header.Set("X-Nonce", tc.nonce)

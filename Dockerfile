@@ -8,6 +8,7 @@ RUN go mod download
 
 COPY . .
 RUN go test ./... -v | tee test_results.txt
+RUN go vet ./...
 RUN go build -v -o /usr/local/bin/app ./...
 
 CMD ["/usr/local/bin/app"]

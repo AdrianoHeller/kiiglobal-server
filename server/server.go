@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -34,6 +33,16 @@ type Input struct {
 	Amount json.Number `json:"amount"`
 }
 
+type Transaction struct {
+	User                         string `json:"user"`
+	Asset                        string `json:"asset"`
+	Amount                       string `json:"amount"`
+	Timestamp                    int64  `json:"timestamp,omitempty"`
+	Nonce                        string `json:"nonce,omitempty"`
+	Signature                    string `json:"signature,omitempty"`
+	PreviousTransactionSignature string `json:"previousTransactionSignature,omitempty"`
+}
+
 type User struct {
 	Name     string            `json:"user"`
 	Balances map[string]string `json:"balances"`
@@ -45,6 +54,8 @@ type Server struct {
 	Vault      *Vault
 	NonceVault *NonceVault
 	Users      []User
+	Ledger     []Transaction
+	LedgerMu   sync.RWMutex
 	AdminKey   string
 }
 
@@ -141,6 +152,14 @@ func formatDecimal(value *big.Float) string {
 	return value.Text('f', 2)
 }
 
+func normalizeDecimal(value string) (string, error) {
+	f, err := parseDecimal(value)
+	if err != nil {
+		return "", err
+	}
+	return formatDecimal(f), nil
+}
+
 func addDecimals(a, b string) (string, error) {
 	aFloat, err := parseDecimal(a)
 	if err != nil {
@@ -198,6 +217,22 @@ func (s *Server) GetAllUsers() []User {
 	defer s.Vault.Mu.RUnlock()
 
 	return s.Users
+}
+
+func (s *Server) RecordTransaction(tx Transaction) {
+	s.LedgerMu.Lock()
+	defer s.LedgerMu.Unlock()
+
+	s.Ledger = append(s.Ledger, tx)
+}
+
+func (s *Server) GetLedger() []Transaction {
+	s.LedgerMu.RLock()
+	defer s.LedgerMu.RUnlock()
+
+	ledgerCopy := make([]Transaction, len(s.Ledger))
+	copy(ledgerCopy, s.Ledger)
+	return ledgerCopy
 }
 
 func (s *Server) ModifyUserBalance(userName, asset, amountStr string, w http.ResponseWriter) bool {
@@ -336,7 +371,7 @@ func (s *Server) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.CheckHTTPMethod(r, "GET") {
+	if !s.CheckHTTPMethod(r, "POST") {
 		s.logError(w, "Invalid HTTP Method", http.StatusMethodNotAllowed)
 		return
 	}
@@ -367,7 +402,8 @@ func (s *Server) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	amountStr := i.Amount.String()
-	if _, err := parseDecimal(amountStr); err != nil {
+	normalizedAmount, err := normalizeDecimal(amountStr)
+	if err != nil {
 		s.logError(w, "Invalid amount format", http.StatusBadRequest)
 		return
 	}
@@ -379,17 +415,30 @@ func (s *Server) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Header.Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(i)
-
-	r.Body = io.NopCloser(bytes.NewReader(body))
-
 	s.Logger.Info("Processed Webhook Request", "user", i.User, "asset", i.Asset, "amount", i.Amount)
 	s.Logger.Info("Valid Webhook Request", "user", i.User, "asset", i.Asset, "amount", i.Amount)
 
 	s.CheckUser(User{Name: i.User, Balances: map[string]string{}})
 
-	s.ModifyUserBalance(i.User, i.Asset, amountStr, w)
+	if ok := s.ModifyUserBalance(i.User, i.Asset, normalizedAmount, w); ok {
+		previousSignature := ""
+		currentLedger := s.GetLedger()
+		if len(currentLedger) > 0 {
+			previousSignature = currentLedger[len(currentLedger)-1].Signature
+		}
+		tx := Transaction{
+			User:                         i.User,
+			Asset:                        i.Asset,
+			Amount:                       normalizedAmount,
+			Timestamp:                    ts,
+			Nonce:                        nonce,
+			Signature:                    r.Header.Get("X-Signature"),
+			PreviousTransactionSignature: previousSignature,
+		}
+		s.RecordTransaction(tx)
+		r.Header.Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(i)
+	}
 }
 
 // Admin Endpoint only
@@ -449,6 +498,26 @@ func (s *Server) UserDetailHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(user)
+}
+
+func (s *Server) LedgerHandler(w http.ResponseWriter, r *http.Request) {
+	r.Header.Set("Content-Type", "application/json")
+
+	if !s.ValidateAdminAccess(s.AdminKey, r) {
+		s.logError(w, "Unauthorized Access", http.StatusUnauthorized)
+		return
+	}
+
+	if !s.validateHeaders(w, r) {
+		return
+	}
+
+	if !s.CheckHTTPMethod(r, "GET") {
+		s.logError(w, "Invalid HTTP Method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	json.NewEncoder(w).Encode(s.GetLedger())
 }
 
 // NonceHandler returns the stored nonces (admin-only)

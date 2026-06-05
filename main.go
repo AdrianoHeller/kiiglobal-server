@@ -36,6 +36,7 @@ func main() {
 	mux.HandleFunc("/nonces", s.NonceHandler)
 	mux.HandleFunc("/users", s.UserHandler)
 	mux.HandleFunc("/balance/", s.UserDetailHandler)
+	mux.HandleFunc("/ledger", s.LedgerHandler)
 
 	s.Logger.Info("Server Running")
 

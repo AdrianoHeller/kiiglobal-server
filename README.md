@@ -52,7 +52,7 @@ chmod +x scripts/run_local.sh
 
 Docker and Docker Compose
 
-The repository includes a `Dockerfile` that now runs tests during the build and writes `test_results.txt` inside the container workspace.
+The repository includes a `Dockerfile` that now runs tests and `go vet` during the build, and writes `test_results.txt` inside the container workspace.
 
 To build and start the app container:
 
@@ -83,7 +83,20 @@ API routes
 - `POST /webhook` — receives HMAC-authenticated webhook payloads and updates user balances.
 - `GET /users` — admin-only endpoint that returns all users.
 - `GET /balance/{user}` — admin-only endpoint that returns an individual user with balances.
+- `GET /ledger` — admin-only endpoint that returns the transaction ledger.
 - `GET /nonces` — admin-only endpoint that returns recorded nonces.
+
+Request signing
+
+- `X-Access-Key` — access key identifying the sender.
+- `X-Timestamp` — UNIX seconds timestamp used for replay protection.
+- `X-Nonce` — unique nonce per request.
+- `X-Signature` — HMAC-SHA256 signature of `timestamp`, `nonce`, and request body.
+- `X-Admin-Key` — required for admin endpoints.
+
+Admin requests must include `X-Admin-Key`, `X-Signature`, and `X-Nonce` headers.
+
+Balances are stored as decimal strings to preserve ledger precision.
 
 TIMESTAMP handling
 
@@ -98,6 +111,7 @@ If `TIMESTAMP_AGE` is missing or invalid, the server uses a default of `5m`.
 Testing
 
 - Run `go test ./... -v` for verbose test output.
+- The project also uses `go vet ./...` during Docker builds for additional static checks.
 - The local runner `scripts/run_local.sh` runs tests first and writes all results to `test_results.txt`.
 - The Docker Compose `tests` service also runs `go test ./... -v | tee test_results.txt`.
 

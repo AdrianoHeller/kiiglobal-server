@@ -35,7 +35,7 @@ func main() {
 
 	serverUrl = fmt.Sprintf("%s/webhook", serverUrl)
 
-	req, err := http.NewRequest("GET", serverUrl, bytes.NewReader(reqBody))
+	req, err := http.NewRequest("POST", serverUrl, bytes.NewReader(reqBody))
 	if err != nil {
 		fmt.Printf("Failed to create request: %v\n", err)
 		return
